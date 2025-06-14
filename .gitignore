@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.env
+.mypy_cache/
+.pytest_cache/
+# Data
+data/
+config/
+mlruns/
