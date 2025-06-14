@@ -47,7 +47,7 @@ class TestOpenAIConnection:
             from langchain_openai import ChatOpenAI, OpenAIEmbeddings
             
             # インスタンス作成時にエラーが発生しないことを確認
-            chat = ChatOpenAI(model_name="gpt-3.5-turbo", openai_api_key="test-key")
+            chat = ChatOpenAI(model_name="gpt-4o", openai_api_key="test-key")
             embeddings = OpenAIEmbeddings(openai_api_key="test-key")
             
             assert chat is not None

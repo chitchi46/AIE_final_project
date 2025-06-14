@@ -19,15 +19,18 @@ class QAGenerateRequest(BaseModel):
 
 class AnswerSubmissionRequest(BaseModel):
     qa_id: int
-    user_id: str
-    answer_text: str
+    student_id: str
+    answer: str
 
 
 # レスポンススキーマ
 class LectureMaterialResponse(BaseModel):
     id: int
+    title: Optional[str]
     filename: str
-    uploaded_at: datetime
+    path: str
+    status: str
+    created_at: datetime
     
     class Config:
         from_attributes = True
@@ -39,7 +42,7 @@ class QAResponse(BaseModel):
     question: str
     answer: str
     difficulty: DifficultyLevel
-    generated_at: datetime
+    created_at: datetime
     
     class Config:
         from_attributes = True
@@ -48,10 +51,10 @@ class QAResponse(BaseModel):
 class AnswerResponse(BaseModel):
     id: int
     qa_id: int
-    user_id: str
-    answer_text: str
+    student_id: str
+    answer: str
     is_correct: bool
-    answered_at: datetime
+    created_at: datetime
     
     class Config:
         from_attributes = True

@@ -15,9 +15,20 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.api.main import app
+from tests.conftest import TestingSessionLocal, engine as test_engine
 
 client = TestClient(app)
 
+@pytest.fixture(scope="function", autouse=True)
+def setup_test_db():
+    """テスト用データベースセットアップ（自動実行）"""
+    # テーブル作成
+    from src.models.database import Base
+    Base.metadata.create_all(bind=test_engine)
+    yield
+    # メモリDBなので自動的にクリーンアップされる
+
+@pytest.mark.usefixtures("setup_test_db")
 class TestAPI:
     """API エンドポイントのテストクラス"""
     
@@ -76,7 +87,8 @@ class TestAPI:
             os.unlink(tmp_file_path)
     
     @patch('src.api.main.qa_generator')
-    def test_upload_success(self, mock_qa_generator):
+    @patch('src.api.main.process_document_background')
+    def test_upload_success(self, mock_background_task, mock_qa_generator):
         """正常なファイルアップロードのテスト"""
         # qa_generatorのモック設定
         mock_qa_generator.process_document.return_value = True
@@ -91,22 +103,24 @@ class TestAPI:
                 response = client.post(
                     "/upload",
                     files={"file": ("lecture.txt", f, "text/plain")},
-                    data={"lecture_id": 1}
+                    data={"lecture_id": 101}  # 新しい講義IDを使用
                 )
             
             assert response.status_code == 200
             data = response.json()
             assert data["success"] is True
-            assert data["lecture_id"] == 1
+            assert data["lecture_id"] == 101
             assert data["filename"] == "lecture.txt"
+            assert data["status"] == "processing"
             
-            # qa_generator.process_document が呼ばれたことを確認
-            mock_qa_generator.process_document.assert_called_once()
+            # バックグラウンドタスクが追加されたことを確認
+            mock_background_task.assert_called_once()
         finally:
             os.unlink(tmp_file_path)
     
     @patch('src.api.main.qa_generator')
-    def test_upload_processing_failure(self, mock_qa_generator):
+    @patch('src.api.main.process_document_background')
+    def test_upload_processing_failure(self, mock_background_task, mock_qa_generator):
         """ドキュメント処理失敗のテスト"""
         # qa_generatorで処理失敗をシミュレート
         mock_qa_generator.process_document.return_value = False
@@ -120,11 +134,13 @@ class TestAPI:
                 response = client.post(
                     "/upload",
                     files={"file": ("test.txt", f, "text/plain")},
-                    data={"lecture_id": 1}
+                    data={"lecture_id": 102}  # 新しい講義IDを使用
                 )
             
-            assert response.status_code == 500
-            assert "ドキュメントの処理に失敗" in response.json()["detail"]
+            assert response.status_code == 200  # 成功するが処理は失敗
+            data = response.json()
+            assert data["success"] is True
+            assert data["status"] == "processing"  # バックグラウンド処理中
         finally:
             os.unlink(tmp_file_path)
     
@@ -145,6 +161,24 @@ class TestAPI:
     @patch('src.api.main.qa_generator')
     def test_generate_qa_success(self, mock_qa_generator):
         """正常なQ&A生成のテスト"""
+        # 事前に講義データを作成
+        from src.models.database import Base
+        Base.metadata.create_all(bind=test_engine)
+        from src.models.database import LectureMaterial
+        db = TestingSessionLocal()
+        try:
+            lecture = LectureMaterial(
+                id=201,
+                title="テスト講義",
+                filename="test.txt",
+                path="/tmp/test.txt",
+                status="ready"
+            )
+            db.add(lecture)
+            db.commit()
+        finally:
+            db.close()
+        
         # qa_generatorのモック設定
         mock_qa_items = [
             {
@@ -163,7 +197,7 @@ class TestAPI:
         response = client.post(
             "/generate_qa",
             json={
-                "lecture_id": 1,
+                "lecture_id": 201,
                 "difficulty": "easy",
                 "num_questions": 2
             }
@@ -172,7 +206,7 @@ class TestAPI:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        assert data["lecture_id"] == 1
+        assert data["lecture_id"] == 201
         assert data["generated_count"] == 2
         assert len(data["qa_items"]) == 2
         assert data["qa_items"][0]["question"] == "テスト質問1"
@@ -193,7 +227,7 @@ class TestAPI:
         )
         
         assert response.status_code == 404
-        assert "インデックスが見つからない" in response.json()["detail"]
+        assert "講義ID 999 が見つかりません" in response.json()["detail"]
     
     @patch('os.path.exists')
     @patch('os.listdir')

@@ -33,7 +33,7 @@ class QAGenerator:
         self.embeddings = OpenAIEmbeddings()
         self.llm = ChatOpenAI(
             temperature=0.7,
-            model_name="gpt-3.5-turbo"
+            model_name="gpt-4o"
         )
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,

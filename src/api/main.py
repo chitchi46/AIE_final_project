@@ -10,9 +10,10 @@ from typing import List, Dict, Optional
 import tempfile
 import shutil
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 import uvicorn
 
 # プロジェクトルートをパスに追加
@@ -23,12 +24,28 @@ sys.path.insert(0, str(project_root))
 from src.services.qa_generator import qa_generator
 from config.settings import UPLOAD_DIR
 
+# データベース関連のインポート
+from src.models.database import create_tables, get_db, LectureMaterial, QA, StudentAnswer
+
 # FastAPIアプリケーション初期化
 app = FastAPI(
     title="Q&A Generation API",
     description="講義資料からQ&Aを自動生成するAPI",
     version="1.0.0"
 )
+
+# アプリケーション起動時にテーブル作成
+@app.on_event("startup")
+async def startup_event():
+    """アプリケーション起動時の処理"""
+    print("🚀 アプリケーション起動中...")
+    try:
+        # データベーステーブル作成
+        create_tables()
+        print("✅ データベーステーブル作成完了")
+    except Exception as e:
+        print(f"❌ データベーステーブル作成エラー: {str(e)}")
+        raise
 
 # CORS設定
 app.add_middleware(
@@ -55,13 +72,87 @@ class QAGenerationResponse(BaseModel):
     lecture_id: int = Field(..., description="講義ID")
     generated_count: int = Field(..., description="生成された質問数")
     qa_items: List[QAItem] = Field(..., description="Q&Aアイテムリスト")
+    generation_id: Optional[str] = Field(None, description="生成ID")
+    difficulty: str = Field(..., description="難易度")
     message: str = Field(default="", description="メッセージ")
 
 class UploadResponse(BaseModel):
     success: bool = Field(..., description="成功フラグ")
     lecture_id: int = Field(..., description="講義ID")
     filename: str = Field(..., description="アップロードされたファイル名")
+    status: str = Field(..., description="処理状態")
     message: str = Field(..., description="メッセージ")
+
+class AnswerRequest(BaseModel):
+    qa_id: int = Field(..., description="Q&AのID")
+    student_id: str = Field(..., description="学生ID")
+    answer: str = Field(..., description="学生の回答")
+
+class AnswerResponse(BaseModel):
+    success: bool = Field(..., description="成功フラグ")
+    qa_id: int = Field(..., description="Q&AのID")
+    student_id: str = Field(..., description="学生ID")
+    is_correct: bool = Field(..., description="正誤判定")
+    correct_answer: str = Field(..., description="正解")
+    message: str = Field(..., description="メッセージ")
+
+class StatsResponse(BaseModel):
+    lecture_id: int = Field(..., description="講義ID")
+    total_questions: int = Field(..., description="総質問数")
+    total_answers: int = Field(..., description="総回答数")
+    correct_answers: int = Field(..., description="正解数")
+    accuracy_rate: float = Field(..., description="正答率")
+    difficulty_breakdown: dict = Field(..., description="難易度別統計")
+
+# バックグラウンドタスク関数
+async def process_document_background(file_path: str, lecture_id: int, filename: str):
+    """
+    バックグラウンドでドキュメント処理を実行
+    """
+    try:
+        print(f"🔄 バックグラウンド処理開始: lecture_id={lecture_id}, file={filename}")
+        
+        # ドキュメント処理
+        success = qa_generator.process_document(file_path, lecture_id)
+        
+        # データベース更新
+        from src.models.database import SessionLocal
+        db = SessionLocal()
+        try:
+            lecture = db.query(LectureMaterial).filter(LectureMaterial.id == lecture_id).first()
+            if lecture:
+                lecture.status = "ready" if success else "error"
+                db.commit()
+                print(f"✅ DB更新完了: lecture_id={lecture_id}, status={lecture.status}")
+            else:
+                print(f"❌ 講義が見つかりません: lecture_id={lecture_id}")
+        finally:
+            db.close()
+            
+        # 処理完了（ファイルは保持）
+        print(f"📁 ファイル保存完了: {file_path}")
+            
+        print(f"✅ バックグラウンド処理完了: lecture_id={lecture_id}")
+        
+    except Exception as e:
+        print(f"❌ バックグラウンド処理エラー: {str(e)}")
+        
+        # エラー時もDB更新
+        try:
+            from src.models.database import SessionLocal
+            db = SessionLocal()
+            try:
+                lecture = db.query(LectureMaterial).filter(LectureMaterial.id == lecture_id).first()
+                if lecture:
+                    lecture.status = "error"
+                    db.commit()
+            finally:
+                db.close()
+        except:
+            pass
+            
+        # エラー時もファイルは保持（デバッグ用）
+        print(f"❌ エラー時ファイル保持: {file_path}")
 
 # エンドポイント定義
 
@@ -73,7 +164,11 @@ async def root():
         "version": "1.0.0",
         "endpoints": {
             "upload": "/upload",
+            "generate": "/generate",
             "generate_qa": "/generate_qa",
+            "answer": "/answer",
+            "stats": "/lectures/{lecture_id}/stats",
+            "status": "/lectures/{lecture_id}/status",
             "health": "/health"
         }
     }
@@ -84,7 +179,7 @@ async def health_check():
     try:
         # OpenAI接続テスト
         from langchain_openai import ChatOpenAI
-        llm = ChatOpenAI(model_name="gpt-3.5-turbo", max_tokens=10)
+        llm = ChatOpenAI(model_name="gpt-4o", max_tokens=10)
         test_response = llm.invoke("test")
         
         return {
@@ -101,11 +196,14 @@ async def health_check():
 
 @app.post("/upload", response_model=UploadResponse)
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    lecture_id: int = Form(...)
+    lecture_id: int = Form(...),
+    title: str = Form(None),
+    db: Session = Depends(get_db)
 ):
     """
-    講義資料をアップロードしてFAISSインデックスを作成
+    講義資料をアップロードしてFAISSインデックスを作成（バックグラウンド処理）
     """
     try:
         # ファイル拡張子チェック
@@ -118,38 +216,54 @@ async def upload_document(
                 detail=f"サポートされていないファイル形式です。対応形式: {', '.join(allowed_extensions)}"
             )
         
-        # アップロードディレクトリ作成
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        # 既存の講義IDチェック
+        existing_lecture = db.query(LectureMaterial).filter(LectureMaterial.id == lecture_id).first()
+        if existing_lecture:
+            raise HTTPException(
+                status_code=400,
+                detail=f"講義ID {lecture_id} は既に存在します。"
+            )
         
-        # 一時ファイルに保存
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_file:
-            shutil.copyfileobj(file.file, tmp_file)
-            tmp_file_path = tmp_file.name
+        # data/raw ディレクトリ作成
+        raw_dir = os.path.join("data", "raw")
+        os.makedirs(raw_dir, exist_ok=True)
         
-        try:
-            # ドキュメント処理
-            success = qa_generator.process_document(tmp_file_path, lecture_id)
-            
-            if success:
-                # 成功時は永続化ディレクトリにコピー
-                permanent_path = os.path.join(UPLOAD_DIR, f"lecture_{lecture_id}_{file.filename}")
-                shutil.copy2(tmp_file_path, permanent_path)
-                
-                return UploadResponse(
-                    success=True,
-                    lecture_id=lecture_id,
-                    filename=file.filename,
-                    message=f"講義 {lecture_id} の資料が正常にアップロードされ、インデックスが作成されました。"
-                )
-            else:
-                raise HTTPException(
-                    status_code=500,
-                    detail="ドキュメントの処理に失敗しました。"
-                )
-                
-        finally:
-            # 一時ファイル削除
-            os.unlink(tmp_file_path)
+        # UUID付きファイル名で保存
+        import uuid
+        file_uuid = str(uuid.uuid4())
+        saved_filename = f"{file_uuid}_{file.filename}"
+        saved_path = os.path.join(raw_dir, saved_filename)
+        
+        # ファイルを直接保存
+        with open(saved_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        
+        # データベースに講義情報を保存（processing状態）
+        lecture_material = LectureMaterial(
+            id=lecture_id,
+            title=title or file.filename,
+            filename=file.filename,
+            path=saved_path,
+            status="processing"
+        )
+        db.add(lecture_material)
+        db.commit()
+        
+        # バックグラウンドタスクでドキュメント処理を実行
+        background_tasks.add_task(
+            process_document_background,
+            saved_path,
+            lecture_id,
+            file.filename
+        )
+        
+        return UploadResponse(
+            success=True,
+            lecture_id=lecture_id,
+            filename=file.filename,
+            status="processing",
+            message=f"講義 {lecture_id} の資料アップロードを開始しました。バックグラウンドで処理中です。"
+        )
             
     except HTTPException:
         raise
@@ -160,9 +274,9 @@ async def upload_document(
         )
 
 @app.post("/generate_qa", response_model=QAGenerationResponse)
-async def generate_qa(request: QAGenerationRequest):
+async def generate_qa(request: QAGenerationRequest, db: Session = Depends(get_db)):
     """
-    指定された講義からQ&Aを生成
+    指定された講義からQ&Aを生成し、データベースに保存
     """
     try:
         # 難易度バリデーション
@@ -171,6 +285,20 @@ async def generate_qa(request: QAGenerationRequest):
             raise HTTPException(
                 status_code=400,
                 detail=f"無効な難易度です。有効な値: {', '.join(valid_difficulties)}"
+            )
+        
+        # 講義の存在確認
+        lecture = db.query(LectureMaterial).filter(LectureMaterial.id == request.lecture_id).first()
+        if not lecture:
+            raise HTTPException(
+                status_code=404,
+                detail=f"講義ID {request.lecture_id} が見つかりません。"
+            )
+        
+        if lecture.status != "ready":
+            raise HTTPException(
+                status_code=400,
+                detail=f"講義 {request.lecture_id} の処理が完了していません。現在の状態: {lecture.status}"
             )
         
         # Q&A生成
@@ -182,9 +310,26 @@ async def generate_qa(request: QAGenerationRequest):
         
         if not qa_items:
             raise HTTPException(
-                status_code=404,
-                detail=f"講義 {request.lecture_id} のインデックスが見つからないか、Q&A生成に失敗しました。"
+                status_code=500,
+                detail=f"講義 {request.lecture_id} のQ&A生成に失敗しました。"
             )
+        
+        # データベースにQ&Aを保存
+        import uuid
+        generation_id = str(uuid.uuid4())
+        
+        db_qa_items = []
+        for item in qa_items:
+            db_qa = QA(
+                lecture_id=request.lecture_id,
+                question=item["question"],
+                answer=item["answer"],
+                difficulty=item["difficulty"]
+            )
+            db.add(db_qa)
+            db_qa_items.append(db_qa)
+        
+        db.commit()
         
         # レスポンス作成
         qa_response_items = [
@@ -201,7 +346,9 @@ async def generate_qa(request: QAGenerationRequest):
             lecture_id=request.lecture_id,
             generated_count=len(qa_response_items),
             qa_items=qa_response_items,
-            message=f"{len(qa_response_items)}個のQ&Aが正常に生成されました。"
+            generation_id=generation_id,
+            difficulty=request.difficulty,
+            message=f"{len(qa_response_items)}個のQ&Aが正常に生成され、データベースに保存されました。"
         )
         
     except HTTPException:
@@ -210,6 +357,149 @@ async def generate_qa(request: QAGenerationRequest):
         raise HTTPException(
             status_code=500,
             detail=f"Q&A生成中にエラーが発生しました: {str(e)}"
+        )
+
+# /generate エイリアス（互換性のため /generate_qa も残す）
+@app.post("/generate", response_model=QAGenerationResponse)
+async def generate_qa_alias(request: QAGenerationRequest, db: Session = Depends(get_db)):
+    """
+    /generate エイリアス - /generate_qa と同じ機能
+    """
+    return await generate_qa(request, db)
+
+@app.post("/answer", response_model=AnswerResponse)
+async def submit_answer(request: AnswerRequest, db: Session = Depends(get_db)):
+    """
+    学生の回答を受け取り、正誤判定を行ってデータベースに保存
+    """
+    try:
+        # Q&Aの存在確認
+        qa = db.query(QA).filter(QA.id == request.qa_id).first()
+        if not qa:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Q&A ID {request.qa_id} が見つかりません。"
+            )
+        
+        # 簡易的な正誤判定（実際の実装では、より高度な判定ロジックを使用）
+        # ここでは、正解と学生の回答の類似度で判定
+        correct_answer = qa.answer.lower().strip()
+        student_answer = request.answer.lower().strip()
+        
+        # 簡易判定: キーワードマッチング
+        is_correct = _simple_answer_check(correct_answer, student_answer)
+        
+        # データベースに学生の回答を保存
+        student_answer_record = StudentAnswer(
+            qa_id=request.qa_id,
+            student_id=request.student_id,
+            answer=request.answer,
+            is_correct=is_correct
+        )
+        db.add(student_answer_record)
+        db.commit()
+        
+        return AnswerResponse(
+            success=True,
+            qa_id=request.qa_id,
+            student_id=request.student_id,
+            is_correct=is_correct,
+            correct_answer=qa.answer,
+            message="回答を受け付けました。" + ("正解です！" if is_correct else "不正解です。")
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"回答処理中にエラーが発生しました: {str(e)}"
+        )
+
+def _simple_answer_check(correct_answer: str, student_answer: str) -> bool:
+    """
+    簡易的な回答チェック
+    """
+    # 基本的なキーワードマッチング
+    correct_keywords = set(correct_answer.split())
+    student_keywords = set(student_answer.split())
+    
+    # 共通キーワードの割合で判定
+    if len(correct_keywords) == 0:
+        return len(student_keywords) == 0
+    
+    common_keywords = correct_keywords.intersection(student_keywords)
+    similarity = len(common_keywords) / len(correct_keywords)
+    
+    # 50%以上のキーワードが一致すれば正解とする
+    return similarity >= 0.5
+
+@app.get("/lectures/{lecture_id}/stats", response_model=StatsResponse)
+async def get_lecture_stats(lecture_id: int, db: Session = Depends(get_db)):
+    """
+    講義・難易度別の正答率などを集計して返却
+    """
+    try:
+        # 講義の存在確認
+        lecture = db.query(LectureMaterial).filter(LectureMaterial.id == lecture_id).first()
+        if not lecture:
+            raise HTTPException(
+                status_code=404,
+                detail=f"講義ID {lecture_id} が見つかりません。"
+            )
+        
+        # 講義のQ&A統計を取得
+        from sqlalchemy import func
+        
+        # 総質問数
+        total_questions = db.query(func.count(QA.id)).filter(QA.lecture_id == lecture_id).scalar()
+        
+        # 総回答数と正解数
+        from sqlalchemy import Integer
+        answer_stats = db.query(
+            func.count(StudentAnswer.id).label('total_answers'),
+            func.sum(func.cast(StudentAnswer.is_correct, Integer)).label('correct_answers')
+        ).join(QA).filter(QA.lecture_id == lecture_id).first()
+        
+        total_answers = answer_stats.total_answers or 0
+        correct_answers = answer_stats.correct_answers or 0
+        accuracy_rate = (correct_answers / total_answers) if total_answers > 0 else 0.0
+        
+        # 難易度別統計
+        difficulty_stats = db.query(
+            QA.difficulty,
+            func.count(StudentAnswer.id).label('total_answers'),
+            func.sum(func.cast(StudentAnswer.is_correct, Integer)).label('correct_answers')
+        ).join(StudentAnswer).filter(QA.lecture_id == lecture_id).group_by(QA.difficulty).all()
+        
+        difficulty_breakdown = {}
+        for stat in difficulty_stats:
+            difficulty = stat.difficulty
+            total = stat.total_answers or 0
+            correct = stat.correct_answers or 0
+            accuracy = (correct / total) if total > 0 else 0.0
+            
+            difficulty_breakdown[difficulty] = {
+                "total_answers": total,
+                "correct_answers": correct,
+                "accuracy_rate": accuracy
+            }
+        
+        return StatsResponse(
+            lecture_id=lecture_id,
+            total_questions=total_questions,
+            total_answers=total_answers,
+            correct_answers=correct_answers,
+            accuracy_rate=accuracy_rate,
+            difficulty_breakdown=difficulty_breakdown
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"統計取得中にエラーが発生しました: {str(e)}"
         )
 
 @app.get("/lectures/{lecture_id}/status")

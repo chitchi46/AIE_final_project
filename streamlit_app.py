@@ -166,7 +166,7 @@ elif operation == "システム状態確認":
         with st.spinner("接続をテスト中..."):
             try:
                 from langchain_openai import ChatOpenAI
-                llm = ChatOpenAI(model_name="gpt-3.5-turbo", max_tokens=10)
+                llm = ChatOpenAI(model_name="gpt-4o", max_tokens=10)
                 response = llm.invoke("test")
                 st.success("✅ OpenAI接続正常")
                 st.info(f"テスト応答: {response.content}")
