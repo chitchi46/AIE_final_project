@@ -3,8 +3,32 @@
 """
 import streamlit as st
 import requests
+import pandas as pd
 from datetime import datetime
 from typing import Dict, List, Optional, Any
+import json
+import re
+from pathlib import Path
+import sys
+
+# プロジェクトルートをパスに追加
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
+
+try:
+    from src.services.api_client import api_client, APIError, APITimeoutError
+    from src.ui.session_manager import session_manager
+except ImportError:
+    api_client = None
+    session_manager = None
+
+# plotlyのインポートを条件付きで行う
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
 
 
 def display_success_box(title: str, content: Dict[str, Any]):
