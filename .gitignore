@@ -10,3 +10,5 @@ data/
 config/
 mlruns/
 *.db
+node_modules/
+.next/
