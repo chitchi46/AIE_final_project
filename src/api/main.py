@@ -22,7 +22,16 @@ sys.path.insert(0, str(project_root))
 
 # サービス層のインポート
 from src.services.qa_generator import qa_generator
-from config.settings import UPLOAD_DIR
+
+# 設定読み込み（緊急修正）
+try:
+    from src.config.settings import settings
+    UPLOAD_DIR = str(settings.UPLOAD_DIR)
+except ImportError:
+    # フォールバック
+    import os
+    UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "uploads")
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # データベース関連のインポート
 from src.models.database import create_tables, get_db, LectureMaterial, QA, StudentAnswer
@@ -61,11 +70,13 @@ class QAGenerationRequest(BaseModel):
     lecture_id: int = Field(..., description="講義ID")
     difficulty: str = Field(..., description="難易度 (easy, medium, hard)")
     num_questions: int = Field(default=5, ge=1, le=20, description="生成する質問数")
+    question_types: Optional[List[str]] = Field(default=None, description="質問タイプのリスト (multiple_choice, short_answer, essay)")
 
 class QAItem(BaseModel):
     question: str = Field(..., description="質問")
     answer: str = Field(..., description="回答")
     difficulty: str = Field(..., description="難易度")
+    question_type: Optional[str] = Field(default=None, description="質問タイプ")
 
 class QAGenerationResponse(BaseModel):
     success: bool = Field(..., description="成功フラグ")
@@ -305,13 +316,15 @@ async def generate_qa(request: QAGenerationRequest, db: Session = Depends(get_db
         qa_items = qa_generator.generate_qa(
             lecture_id=request.lecture_id,
             difficulty=request.difficulty,
-            num_questions=request.num_questions
+            num_questions=request.num_questions,
+            question_types=request.question_types
         )
         
         if not qa_items:
+            # 空回答の場合は422 Unprocessable Entityで詳細な情報を返す
             raise HTTPException(
-                status_code=500,
-                detail=f"講義 {request.lecture_id} のQ&A生成に失敗しました。"
+                status_code=422,
+                detail=f"講義 {request.lecture_id} からQ&Aを生成できませんでした。講義内容が不十分であるか、FAISSインデックスが存在しない可能性があります。講義の処理状況を確認してください。"
             )
         
         # データベースにQ&Aを保存
@@ -324,7 +337,8 @@ async def generate_qa(request: QAGenerationRequest, db: Session = Depends(get_db
                 lecture_id=request.lecture_id,
                 question=item["question"],
                 answer=item["answer"],
-                difficulty=item["difficulty"]
+                difficulty=item["difficulty"],
+                question_type=item.get("question_type")
             )
             db.add(db_qa)
             db_qa_items.append(db_qa)
@@ -336,7 +350,8 @@ async def generate_qa(request: QAGenerationRequest, db: Session = Depends(get_db
             QAItem(
                 question=item["question"],
                 answer=item["answer"],
-                difficulty=item["difficulty"]
+                difficulty=item["difficulty"],
+                question_type=item.get("question_type")
             )
             for item in qa_items
         ]
@@ -381,13 +396,21 @@ async def submit_answer(request: AnswerRequest, db: Session = Depends(get_db)):
                 detail=f"Q&A ID {request.qa_id} が見つかりません。"
             )
         
-        # 簡易的な正誤判定（実際の実装では、より高度な判定ロジックを使用）
-        # ここでは、正解と学生の回答の類似度で判定
-        correct_answer = qa.answer.lower().strip()
-        student_answer = request.answer.lower().strip()
-        
-        # 簡易判定: キーワードマッチング
-        is_correct = _simple_answer_check(correct_answer, student_answer)
+        # 質問タイプに応じた正誤判定
+        if qa.question_type == "multiple_choice":
+            # 選択問題の場合: 正解の選択肢を抽出して比較
+            import re
+            correct_match = re.search(r'正解:\s*([A-D])', qa.answer)
+            if correct_match:
+                correct_choice = correct_match.group(1).upper()
+                student_choice = request.answer.upper().strip()
+                is_correct = (correct_choice == student_choice)
+            else:
+                # フォールバック: 従来の判定方法
+                is_correct = _simple_answer_check(qa.answer.lower().strip(), request.answer.lower().strip())
+        else:
+            # 短答問題・記述問題の場合: キーワードマッチング
+            is_correct = _simple_answer_check(qa.answer.lower().strip(), request.answer.lower().strip())
         
         # データベースに学生の回答を保存
         student_answer_record = StudentAnswer(
@@ -502,13 +525,68 @@ async def get_lecture_stats(lecture_id: int, db: Session = Depends(get_db)):
             detail=f"統計取得中にエラーが発生しました: {str(e)}"
         )
 
+@app.get("/lectures/{lecture_id}/qas")
+async def get_lecture_qas(lecture_id: int, db: Session = Depends(get_db)):
+    """
+    講義のQ&Aリストを取得
+    """
+    try:
+        import json
+        
+        # 講義の存在確認
+        lecture = db.query(LectureMaterial).filter(LectureMaterial.id == lecture_id).first()
+        if not lecture:
+            raise HTTPException(
+                status_code=404,
+                detail=f"講義ID {lecture_id} が見つかりません。"
+            )
+        
+        # Q&Aを取得
+        qas = db.query(QA).filter(QA.lecture_id == lecture_id).order_by(QA.created_at.desc()).all()
+        
+        qa_items = []
+        for qa in qas:
+            qa_item = {
+                "id": qa.id,
+                "question": qa.question,
+                "answer": qa.answer,
+                "difficulty": qa.difficulty,
+                "question_type": qa.question_type,
+                "created_at": qa.created_at.isoformat() if qa.created_at else None
+            }
+            qa_items.append(qa_item)
+        
+        return {
+            "success": True,
+            "lecture_id": lecture_id,
+            "lecture_title": lecture.title,
+            "qa_count": len(qa_items),
+            "qa_items": qa_items
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Q&A取得中にエラーが発生しました: {str(e)}"
+        )
+
 @app.get("/lectures/{lecture_id}/status")
 async def get_lecture_status(lecture_id: int):
     """
     指定された講義のインデックス状態を確認
     """
     try:
-        from config.settings import FAISS_INDEX_DIR
+        # 設定読み込み（緊急修正）
+        try:
+            from src.config.settings import settings
+            FAISS_INDEX_DIR = str(settings.FAISS_INDEX_DIR)
+        except ImportError:
+            # フォールバック
+            import os
+            FAISS_INDEX_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "faiss_index")
+        
         index_path = os.path.join(FAISS_INDEX_DIR, f"lecture_{lecture_id}")
         
         if os.path.exists(index_path):

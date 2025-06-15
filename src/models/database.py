@@ -6,7 +6,7 @@ import sys
 import os
 
 # データベース設定
-engine = create_engine('sqlite:///./qa_system.db', echo=False, future=True)
+engine = create_engine('sqlite:///./qa_system.db', echo=False, future=True, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
@@ -34,6 +34,7 @@ class QA(Base):
     question = Column(Text, nullable=False)
     answer = Column(Text, nullable=False)
     difficulty = Column(String(20), nullable=False)  # easy, medium, hard
+    question_type = Column(String(50), nullable=True)  # multiple_choice, short_answer, essay
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # リレーション
